@@ -1700,6 +1700,29 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_SOFT_MAX_BACK:
+            {
+                if (!has_simdgroup_reduction ||
+                    op->type != GGML_TYPE_F32 ||
+                    op->src[0] == NULL || op->src[1] == NULL ||
+                    op->src[0]->type != GGML_TYPE_F32 ||
+                    op->src[1]->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous_1(op->src[0]) ||
+                    !ggml_is_contiguous_1(op->src[1]) ||
+                    !ggml_is_contiguous_1(op) ||
+                    !ggml_are_same_shape(op, op->src[0]) ||
+                    !ggml_are_same_shape(op, op->src[1])) {
+                    return false;
+                }
+
+                float max_bias = 0.0f;
+                memcpy(&max_bias, ((const float *) op->op_params) + 1, sizeof(float));
+                if (max_bias != 0.0f) {
+                    return false;
+                }
+
+                return true;
+            }
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
