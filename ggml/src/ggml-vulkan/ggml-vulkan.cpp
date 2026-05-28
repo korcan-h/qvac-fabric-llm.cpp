@@ -3753,7 +3753,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
 
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if 0 // qvac: FlashAttn MMQ (_int8) variants disabled — matches the
+      // shader-gen gate above. flash_attn_mmq_funcs.glsl references the
+      // FaTypeK spec constant that was never ported into the qvac fork's
+      // macro-based dispatch, so the _int8 shader binaries don't exist.
+      // The non-_int8 FA path below covers Q4_0/Q8_0/Q4_1/Q5_0/Q5_1/IQ4_NL
+      // on every backend. Other integer-dot paths (mul_mat_mat_q8_1,
+      // mul_mat_vec_q8_1, incl. TQ2_0) are unaffected.
         if (device->integer_dot_product && device->subgroup_clustered) {
             CREATE_FA(GGML_TYPE_Q4_0,     q4_0, FA_SCALAR, _int8)
             CREATE_FA(GGML_TYPE_Q8_0,     q8_0, FA_SCALAR, _int8)
@@ -3784,7 +3790,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
 
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if 0 // qvac: FlashAttn MMQ (_fp32_int8) variants disabled — see matching gate above.
         if (device->integer_dot_product && device->subgroup_clustered) {
             CREATE_FA(GGML_TYPE_Q4_0,     q4_0, FA_SCALAR, _fp32_int8)
             CREATE_FA(GGML_TYPE_Q8_0,     q8_0, FA_SCALAR, _fp32_int8)
