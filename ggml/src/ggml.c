@@ -6965,6 +6965,9 @@ struct ggml_tensor * ggml_gated_delta_net_back(
     const int64_t gdn_H         = v->ne[1];
     const int64_t gdn_n_tokens  = v->ne[2];
     const int64_t gdn_n_seqs    = v->ne[3];
+    const int64_t gdn_n_wg      = q->ne[1] * q->ne[3];
+    const int64_t gdn_wg_stride = gdn_n_tokens * (2 * gdn_S_v * gdn_S_v + 2 * gdn_S_v) + gdn_S_v * gdn_S_v;
+    end += GGML_PAD(gdn_n_wg * gdn_wg_stride * (int64_t) tsize, GGML_MEM_ALIGN);
 
     const int64_t nelements = (end + tsize - 1) / tsize;
 
