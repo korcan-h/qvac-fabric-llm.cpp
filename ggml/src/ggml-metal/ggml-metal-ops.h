@@ -113,6 +113,7 @@ int ggml_metal_op_sigmoid_back      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm_back      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv_back_sx  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv_back_c   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx);
 
 #ifdef __cplusplus
 }

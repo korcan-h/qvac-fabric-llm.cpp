@@ -724,6 +724,27 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv_back_c;
 
 typedef struct {
+    int32_t  H;
+    int32_t  n_tokens;
+    int32_t  n_seqs;
+    int32_t  K;
+    int32_t  neq1;
+    int32_t  rq3;
+    uint64_t s_off;
+    uint64_t sq1, sq2, sq3;
+    uint64_t sv1, sv2, sv3;
+    uint64_t sb1, sb2, sb3;
+    uint64_t off_dk;
+    uint64_t off_dv;
+    uint64_t off_dg;
+    uint64_t off_db;
+    uint64_t off_ds;
+    uint64_t off_scratch;
+    uint64_t wg_stride;
+    float    scale;
+} ggml_metal_kargs_gated_delta_net_back;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
