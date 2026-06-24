@@ -694,6 +694,36 @@ typedef struct {
 } ggml_metal_kargs_l2_norm_back;
 
 typedef struct {
+    int32_t  nc;
+    int32_t  ncs;
+    int32_t  nr;
+    int32_t  n_t;
+    int32_t  n_s;
+    uint64_t grad_nb0;
+    uint64_t grad_nb1;
+    uint64_t grad_nb2;
+    uint64_t c_nb1;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_ssm_conv_back_sx;
+
+typedef struct {
+    int32_t  nc;
+    int32_t  ncs;
+    int32_t  nr;
+    int32_t  n_t;
+    int32_t  n_s;
+    uint64_t grad_nb0;
+    uint64_t grad_nb1;
+    uint64_t grad_nb2;
+    uint64_t sx_nb0;
+    uint64_t sx_nb1;
+    uint64_t sx_nb2;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_ssm_conv_back_c;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
