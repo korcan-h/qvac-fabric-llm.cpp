@@ -5563,6 +5563,8 @@ struct test_gated_delta_net_back : public test_case {
         return "GATED_DELTA_NET_BACK";
     }
 
+    bool run_whole_graph() override { return true; }
+
     test_gated_delta_net_back(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -5603,9 +5605,19 @@ struct test_gated_delta_net_back : public test_case {
         ggml_tensor * d = ggml_new_tensor_2d(ctx, type, head_size * head_count * v_repeat, n_seq_tokens * n_seqs + state_rows);
         ggml_set_name(d, "d");
 
-        ggml_tensor * out = ggml_gated_delta_net_back(ctx, q, k, v, g, beta, state, d);
-        ggml_set_name(out, "out");
+        ggml_tensor * back = ggml_gated_delta_net_back(ctx, q, k, v, g, beta, state, d);
 
+        // sum of GGML_MEM_ALIGN-padded nelements(q,k,v,g,beta,state), i.e. everything before the scratch tail
+        const size_t tsize = ggml_type_size(GGML_TYPE_F32);
+        size_t n_meaningful_bytes = 0;
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(q)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(k)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(v)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(g)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(beta)  * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(state) * tsize, GGML_MEM_ALIGN);
+
+        ggml_tensor * out = ggml_view_1d(ctx, back, (int64_t) (n_meaningful_bytes / tsize), 0);
         return out;
     }
 
