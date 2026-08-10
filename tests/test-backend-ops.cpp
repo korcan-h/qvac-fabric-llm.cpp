@@ -5617,6 +5617,10 @@ struct test_gated_delta_net_back : public test_case {
         n_meaningful_bytes += GGML_PAD(ggml_nelements(beta)  * tsize, GGML_MEM_ALIGN);
         n_meaningful_bytes += GGML_PAD(ggml_nelements(state) * tsize, GGML_MEM_ALIGN);
 
+        if (mode == MODE_PERF) {
+            return back;
+        }
+
         ggml_tensor * out = ggml_view_1d(ctx, back, (int64_t) (n_meaningful_bytes / tsize), 0);
         return out;
     }
