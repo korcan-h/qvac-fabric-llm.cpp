@@ -25,54 +25,41 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = value;
 }
 
-// bounds_check is a literal at every call site: the caller only passes true for
-// the ragged last tile in M, so interior tiles fold the checks away entirely.
-void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const bool bounds_check, const uint block, const uint end_k) {
+// Reads clamp to col_max, the last column of this tile present in A: the base is
+// shifted so an out-of-range lane re-reads that column instead of running past the
+// tensor, and its result is discarded at store time. Stores stay unclamped. Every
+// unguarded read requires ALIGNED, where stride_a is a whole number of LOAD_VEC_A
+// elements, so the shift is exact.
+void load_a_to_shmem(const uint pos_a_in, const uint row, const uint col, const uint col_max, const uint block, const uint end_k) {
+    const uint over  = col > col_max ? col - col_max : 0u;
+    const uint pos_a = pos_a_in - over * p.stride_a / LOAD_VEC_A;
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
             if (ALIGNED != 0) {
                 const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
                 const uint k_pair = row * LOAD_VEC_A / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about M. Nothing pads A out to a whole BM tile, so the last
-                // tile must still be bounded or this vector load runs past the tensor.
-                if (!bounds_check || idx_m < p.M) {
-                    FLOAT_TYPEV8 aa = FLOAT_TYPEV8(data_a[idx]);
-                    store_a(col, k_pair,     aa[0].xy);
-                    store_a(col, k_pair + 1, aa[0].zw);
-                    store_a(col, k_pair + 2, aa[1].xy);
-                    store_a(col, k_pair + 3, aa[1].zw);
-                } else {
-                    store_a(col, k_pair,     FLOAT_TYPEV2(0.0f));
-                    store_a(col, k_pair + 1, FLOAT_TYPEV2(0.0f));
-                    store_a(col, k_pair + 2, FLOAT_TYPEV2(0.0f));
-                    store_a(col, k_pair + 3, FLOAT_TYPEV2(0.0f));
-                }
+                FLOAT_TYPEV8 aa = FLOAT_TYPEV8(data_a[idx]);
+                store_a(col, k_pair,     aa[0].xy);
+                store_a(col, k_pair + 1, aa[0].zw);
+                store_a(col, k_pair + 2, aa[1].xy);
+                store_a(col, k_pair + 3, aa[1].zw);
                 return;
             }
 #elif LOAD_VEC_A == 4
             if (ALIGNED != 0) {
                 const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
                 const uint k_pair = row * LOAD_VEC_A / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about M. Nothing pads A out to a whole BM tile, so the last
-                // tile must still be bounded or this vector load runs past the tensor.
-                if (!bounds_check || idx_m < p.M) {
-                    FLOAT_TYPEV4 aa = FLOAT_TYPEV4(data_a[idx]);
-                    store_a(col, k_pair,     aa.xy);
-                    store_a(col, k_pair + 1, aa.zw);
-                } else {
-                    store_a(col, k_pair,     FLOAT_TYPEV2(0.0f));
-                    store_a(col, k_pair + 1, FLOAT_TYPEV2(0.0f));
-                }
+                FLOAT_TYPEV4 aa = FLOAT_TYPEV4(data_a[idx]);
+                store_a(col, k_pair,     aa.xy);
+                store_a(col, k_pair + 1, aa.zw);
                 return;
             }
 #endif
             const uint idx = pos_a + col * p.stride_a + row * 2;
-            if (idx_m < p.M && block + row * 2 + 1 < end_k) {
+            if (col <= col_max && block + row * 2 + 1 < end_k) {
                 store_a(col, row, FLOAT_TYPEV2(data_a_scalar[idx],
                                                data_a_scalar[idx + 1]));
-            } else if (idx_m < p.M && block + row * 2 < end_k) {
+            } else if (col <= col_max && block + row * 2 < end_k) {
                 store_a(col, row, FLOAT_TYPEV2(data_a_scalar[idx], 0.0f));
             } else {
                 store_a(col, row, FLOAT_TYPEV2(0.0f));
@@ -82,25 +69,17 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             if (ALIGNED != 0) {
                 const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
                 const uint k_pair = row * LOAD_VEC_A / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about M. Nothing pads A out to a whole BM tile, so the last
-                // tile must still be bounded or this vector load runs past the tensor.
-                if (!bounds_check || idx_m < p.M) {
-                    FLOAT_TYPEV4 aa = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_a[idx]));
-                    store_a(col, k_pair,     aa.xy);
-                    store_a(col, k_pair + 1, aa.zw);
-                } else {
-                    store_a(col, k_pair,     FLOAT_TYPEV2(0.0f));
-                    store_a(col, k_pair + 1, FLOAT_TYPEV2(0.0f));
-                }
+                FLOAT_TYPEV4 aa = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_a[idx]));
+                store_a(col, k_pair,     aa.xy);
+                store_a(col, k_pair + 1, aa.zw);
                 return;
             }
 #endif
             const uint idx = pos_a + col * p.stride_a + row * 2;
-            if (idx_m < p.M && block + row * 2 + 1 < end_k) {
+            if (col <= col_max && block + row * 2 + 1 < end_k) {
                 store_a(col, row, FLOAT_TYPEV2(TO_FLOAT_TYPE(data_a_scalar[idx]),
                                                TO_FLOAT_TYPE(data_a_scalar[idx + 1])));
-            } else if (idx_m < p.M && block + row * 2 < end_k) {
+            } else if (col <= col_max && block + row * 2 < end_k) {
                 store_a(col, row, FLOAT_TYPEV2(TO_FLOAT_TYPE(data_a_scalar[idx]), 0.0f));
             } else {
                 store_a(col, row, FLOAT_TYPEV2(0.0f));
@@ -760,125 +739,89 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 }
 
 #if !defined(MUL_MAT_ID)
-// bounds_check is a literal at every call site: the caller only passes true for
-// the ragged last tile in N, so interior tiles fold the checks away entirely.
-void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const bool bounds_check, const uint block, const uint end_k) {
+// Reads clamp to col_max, the last column of this tile present in B; see
+// load_a_to_shmem.
+void load_b_to_shmem(const uint pos_b_in, const uint row, const uint col, const uint col_max, const uint block, const uint end_k) {
+    const uint over  = col > col_max ? col - col_max : 0u;
+    const uint pos_b = pos_b_in - over * p.stride_b / LOAD_VEC_B;
 #if LOAD_VEC_B == 8
             if (ALIGNED != 0) {
                 // Not supported for b_type bf16 because bf16mat2x4 does not exist
                 const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about N. B is padded out to a whole BN tile only when it is
-                // staged through prealloc_y, so when src1 is read in place the last
-                // tile must still be bounded or this vector load runs past the tensor.
-                if (!bounds_check || idx_n < p.N) {
-                    FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-                    buf_b[buf_idx + 0] = bb[0].xy;
-                    buf_b[buf_idx + 1] = bb[0].zw;
-                    buf_b[buf_idx + 2] = bb[1].xy;
-                    buf_b[buf_idx + 3] = bb[1].zw;
-                } else {
-                    buf_b[buf_idx + 0] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 1] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 2] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 3] = FLOAT_TYPEV2(0.0f);
-                }
+                FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+                buf_b[buf_idx + 0] = bb[0].xy;
+                buf_b[buf_idx + 1] = bb[0].zw;
+                buf_b[buf_idx + 2] = bb[1].xy;
+                buf_b[buf_idx + 3] = bb[1].zw;
                 return;
             }
 #elif LOAD_VEC_B == 4
             if (ALIGNED != 0) {
                 const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about N. B is padded out to a whole BN tile only when it is
-                // staged through prealloc_y, so when src1 is read in place the last
-                // tile must still be bounded or this vector load runs past the tensor.
-                if (!bounds_check || idx_n < p.N) {
 #if defined(DATA_B_BF16)
-                    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
+                FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
 #else
-                    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
+                FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-                    buf_b[buf_idx + 0] = bb.xy;
-                    buf_b[buf_idx + 1] = bb.zw;
-                } else {
-                    buf_b[buf_idx + 0] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 1] = FLOAT_TYPEV2(0.0f);
-                }
+                buf_b[buf_idx + 0] = bb.xy;
+                buf_b[buf_idx + 1] = bb.zw;
                 return;
             }
 #endif
             const uint idx = pos_b + col * p.stride_b + row * 2;
             const uint buf_idx = col * SHMEM_STRIDE + row;
-            if (idx_n < p.N && block + row * 2 + 1 < end_k) {
+            if (col <= col_max && block + row * 2 + 1 < end_k) {
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
                                               TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
-            } else if (idx_n < p.N && block + row * 2 < end_k) {
+            } else if (col <= col_max && block + row * 2 < end_k) {
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
             } else {
                 buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
             }
 }
 #else
-// bounds_check is a literal at every call site: the caller only passes true for
-// the tile straddling _ne1, so interior tiles fold the checks away entirely.
-void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint ic, const uint _ne1, const bool bounds_check, const uint block, const uint end_k) {
+// Reads clamp to col_max, the last column backed by a row_ids entry: past it the
+// entry is unwritten, so an unclamped lookup would become a wild offset into B.
+void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint col_max, const uint block, const uint end_k) {
+    const uint col_r = min(col, col_max);
 #if LOAD_VEC_B == 8
             if (ALIGNED != 0) {
                 // Not supported for b_type bf16 because bf16mat2x4 does not exist
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about the expert row count. Past _ne1 the row_ids entry is
-                // unset, so this must be bounded or it becomes a wild offset into B.
-                if (!bounds_check || ic * BN + col < _ne1) {
-                    const u16vec2 row_idx = row_ids[col];
-                    const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
-                    FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-                    buf_b[buf_idx + 0] = bb[0].xy;
-                    buf_b[buf_idx + 1] = bb[0].zw;
-                    buf_b[buf_idx + 2] = bb[1].xy;
-                    buf_b[buf_idx + 3] = bb[1].zw;
-                } else {
-                    buf_b[buf_idx + 0] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 1] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 2] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 3] = FLOAT_TYPEV2(0.0f);
-                }
+                const u16vec2 row_idx = row_ids[col_r];
+                const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+                FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+                buf_b[buf_idx + 0] = bb[0].xy;
+                buf_b[buf_idx + 1] = bb[0].zw;
+                buf_b[buf_idx + 2] = bb[1].xy;
+                buf_b[buf_idx + 3] = bb[1].zw;
                 return;
             }
 #elif LOAD_VEC_B == 4
             if (ALIGNED != 0) {
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
-                // ALIGNED only guarantees that K is a whole number of tiles; it says
-                // nothing about the expert row count. Past _ne1 the row_ids entry is
-                // unset, so this must be bounded or it becomes a wild offset into B.
-                if (!bounds_check || ic * BN + col < _ne1) {
-                    const u16vec2 row_idx = row_ids[col];
-                    const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+                const u16vec2 row_idx = row_ids[col_r];
+                const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
 #if defined(DATA_B_BF16)
-                    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
+                FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
 #else
-                    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
+                FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-                    buf_b[buf_idx + 0] = bb.xy;
-                    buf_b[buf_idx + 1] = bb.zw;
-                } else {
-                    buf_b[buf_idx + 0] = FLOAT_TYPEV2(0.0f);
-                    buf_b[buf_idx + 1] = FLOAT_TYPEV2(0.0f);
-                }
+                buf_b[buf_idx + 0] = bb.xy;
+                buf_b[buf_idx + 1] = bb.zw;
                 return;
             }
 #endif
-            const uint row_i = ic * BN + col;
             const uint buf_idx = col * SHMEM_STRIDE + row;
-            if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
-                const u16vec2 row_idx = row_ids[col];
+            if (col <= col_max && block + row * 2 + 1 < end_k) {
+                const u16vec2 row_idx = row_ids[col_r];
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
                                               TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
-            } else if (row_i < _ne1 && block + row * 2 < end_k) {
-                const u16vec2 row_idx = row_ids[col];
+            } else if (col <= col_max && block + row * 2 < end_k) {
+                const u16vec2 row_idx = row_ids[col_r];
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
             } else {
