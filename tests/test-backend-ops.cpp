@@ -10804,6 +10804,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t rows : {31, 32, 33, 65, 256}) {
+        for (bool trans_b : {false, true}) {
+            test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32,
+                                                      32, rows, 65536, {1, 1}, {1, 1}, trans_b));
+        }
+    }
+
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
