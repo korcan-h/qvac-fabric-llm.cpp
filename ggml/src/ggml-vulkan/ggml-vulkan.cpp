@@ -14555,7 +14555,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         if constexpr (std::is_same<PC, vk_op_binary_push_constants>::value) {
             if (split_out_prod) {
                 std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
-                const auto submit_and_wait = [&]() {
+                const char * no_fence = getenv("GGML_VK_OUT_PROD_NO_FENCE");
+                const bool wait_for_chunks = no_fence == nullptr || strcmp(no_fence, "1") != 0;
+                const auto submit_chunk = [&]() {
                     ggml_vk_ctx_end(subctx);
                     for (auto& cpy : subctx->in_memcpys) {
                         memcpy(cpy.dst, cpy.src, cpy.n);
@@ -14565,19 +14567,24 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                         memset(mset.dst, mset.val, mset.n);
                     }
                     subctx->memsets.clear();
-                    ggml_vk_submit(subctx, ctx->device->fence);
-                    VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
-                             "out_prod chunk waitForFences", ctx->device);
-                    ctx->device->device.resetFences({ ctx->device->fence });
+                    if (wait_for_chunks) {
+                        ggml_vk_submit(subctx, ctx->device->fence);
+                        VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
+                                 "out_prod chunk waitForFences", ctx->device);
+                        ctx->device->device.resetFences({ ctx->device->fence });
+                    } else {
+                        ggml_vk_submit(subctx, {});
+                        ctx->submit_pending = true;
+                    }
                     ggml_vk_ctx_begin(ctx->device, subctx);
                 };
-                submit_and_wait();
+                submit_chunk();
                 for (uint32_t chunk = 0; chunk < out_prod_chunks; ++chunk) {
                     const uint32_t row_offset = chunk * 32;
                     memcpy(&pc.param1, &row_offset, sizeof(row_offset));
                     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                         { src0_buf, src1_buf, dst_buf }, pc, { elements[0], 1, 1 });
-                    submit_and_wait();
+                    submit_chunk();
                 }
                 return;
             }
