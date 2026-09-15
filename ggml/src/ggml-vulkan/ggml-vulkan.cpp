@@ -14119,7 +14119,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 
     const bool split_out_prod = op == GGML_OP_OUT_PROD &&
-        pipeline == ctx->device->pipeline_out_prod_tiled_q8_0 &&
+        (pipeline == ctx->device->pipeline_out_prod_tiled_f32 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_f16_f32 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_q4_0 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_q8_0 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_tq2_0) &&
         ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
         ne01 >= 65536 && dst->ne[1] > 32 && dst->ne[2] == 1 && dst->ne[3] == 1;
     const uint32_t out_prod_chunks = split_out_prod ? CEIL_DIV(dst->ne[1], 32) : 1;
@@ -14553,6 +14557,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
                 const auto submit_and_wait = [&]() {
                     ggml_vk_ctx_end(subctx);
+                    for (auto& cpy : subctx->in_memcpys) {
+                        memcpy(cpy.dst, cpy.src, cpy.n);
+                    }
+                    subctx->in_memcpys.clear();
+                    for (auto& mset : subctx->memsets) {
+                        memset(mset.dst, mset.val, mset.n);
+                    }
+                    subctx->memsets.clear();
                     ggml_vk_submit(subctx, ctx->device->fence);
                     VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
                              "out_prod chunk waitForFences", ctx->device);
