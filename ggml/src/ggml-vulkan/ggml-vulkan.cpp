@@ -9710,6 +9710,63 @@ static void ggml_vk_dispatch_rows_chunked(ggml_backend_vk_context* ctx,
     return;
 }
 
+template <typename T, typename SetPcRowOffsetFun>
+static void ggml_vk_dispatch_rows_chunked(ggml_backend_vk_context* ctx,
+                                          vk_context& subctx,
+                                          vk_pipeline& pipeline,
+                                          const std::array<uint32_t, 3>& elements,
+                                          uint32_t chunk_count,
+                                          T &push_constants,
+                                          std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos,
+                                          SetPcRowOffsetFun&& set_row_offset) {
+    
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+
+    const auto wait_for_submission = [&]() {
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
+                    "dispatch_rows_chunked waitForFences", ctx->device);
+        ctx->device->device.resetFences({ ctx->device->fence });
+    };
+    
+    if (!subctx->in_memcpys.empty() || !subctx->memsets.empty()) {
+        if (ctx->device->async_use_transfer_queue) {
+            ctx->device->transfer_queue->handle->submit({}, ctx->device->fence);
+            wait_for_submission();
+        }
+        subctx->p->q->handle->submit({}, ctx->device->fence);
+        wait_for_submission();
+    }
+
+    const auto submit_chunk = [&](const bool wait) {
+        ggml_vk_ctx_end(subctx);
+        for (auto& cpy : subctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        subctx->in_memcpys.clear();
+        for (auto& mset : subctx->memsets) {
+            memset(mset.dst, mset.val, mset.n);
+        }
+        subctx->memsets.clear();
+        if (wait) {
+            ggml_vk_submit(subctx, ctx->device->fence);
+            wait_for_submission();
+        } else {
+            ggml_vk_submit(subctx, {});
+            ctx->submit_pending = true;
+        }
+        ggml_vk_ctx_begin(ctx->device, subctx);
+    };
+
+    submit_chunk(false);
+    for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
+        const uint32_t row_offset = chunk * 32;
+        set_row_offset(push_constants, row_offset);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, descriptor_buffer_infos, push_constants, elements);
+        submit_chunk((chunk + 1) == chunk_count);
+    }
+    return;
+}
+
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     vk_context result;
     if (!ctx->compute_ctx.expired()) {
