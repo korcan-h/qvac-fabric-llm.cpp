@@ -13601,7 +13601,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (ctx->device->uma &&
             (ctx->device->driver_id == vk::DriverId::eMesaRadv ||
              ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) &&
-            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            CEIL_DIV(dst->ne[0], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+            CEIL_DIV(dst->ne[1], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+            dst->ne[2] * dst->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
             if (src0->type == GGML_TYPE_F32) return ctx->device->pipeline_out_prod_tiled_f32;
             if (src0->type == GGML_TYPE_F16) return ctx->device->pipeline_out_prod_tiled_f16_f32;
             if (src0->type == GGML_TYPE_Q4_0) return ctx->device->pipeline_out_prod_tiled_q4_0;
@@ -14557,7 +14560,20 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
                 const char * no_fence = getenv("GGML_VK_OUT_PROD_NO_FENCE");
                 const bool wait_for_chunks = no_fence == nullptr || strcmp(no_fence, "1") != 0;
-                const auto submit_chunk = [&]() {
+                const auto wait_for_submission = [&]() {
+                    VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
+                             "out_prod chunk waitForFences", ctx->device);
+                    ctx->device->device.resetFences({ ctx->device->fence });
+                };
+                if (!subctx->in_memcpys.empty() || !subctx->memsets.empty()) {
+                    if (ctx->device->async_use_transfer_queue) {
+                        ctx->device->transfer_queue->handle->submit({}, ctx->device->fence);
+                        wait_for_submission();
+                    }
+                    subctx->p->q->handle->submit({}, ctx->device->fence);
+                    wait_for_submission();
+                }
+                const auto submit_chunk = [&](bool wait) {
                     ggml_vk_ctx_end(subctx);
                     for (auto& cpy : subctx->in_memcpys) {
                         memcpy(cpy.dst, cpy.src, cpy.n);
@@ -14567,24 +14583,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                         memset(mset.dst, mset.val, mset.n);
                     }
                     subctx->memsets.clear();
-                    if (wait_for_chunks) {
+                    if (wait) {
                         ggml_vk_submit(subctx, ctx->device->fence);
-                        VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
-                                 "out_prod chunk waitForFences", ctx->device);
-                        ctx->device->device.resetFences({ ctx->device->fence });
+                        wait_for_submission();
                     } else {
                         ggml_vk_submit(subctx, {});
                         ctx->submit_pending = true;
                     }
                     ggml_vk_ctx_begin(ctx->device, subctx);
                 };
-                submit_chunk();
+                submit_chunk(wait_for_chunks);
                 for (uint32_t chunk = 0; chunk < out_prod_chunks; ++chunk) {
                     const uint32_t row_offset = chunk * 32;
                     memcpy(&pc.param1, &row_offset, sizeof(row_offset));
                     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                         { src0_buf, src1_buf, dst_buf }, pc, { elements[0], 1, 1 });
-                    submit_chunk();
+                    submit_chunk(wait_for_chunks || chunk + 1 == out_prod_chunks);
                 }
                 return;
             }
