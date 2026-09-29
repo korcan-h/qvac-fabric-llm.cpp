@@ -2592,14 +2592,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
            struct ggml_tensor  * k,
            struct ggml_tensor  * v,
-           struct ggml_tensor  * d,
-           bool                  masked);
+           struct ggml_tensor  * mask,
+           struct ggml_tensor  * d, // dL/dO: gradient w.r.t. the forward FA output
+           struct ggml_tensor  * o, // O: the forward FA output
+           float                 scale,
+           float                 max_bias,
+           float                 logit_softcap);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,

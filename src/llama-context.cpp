@@ -3646,8 +3646,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
+    if (cparams.flash_attn && !lopt_params.flash_attn) {
+        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass (enable with --train-flash-attn)\n", __func__);
         cparams.flash_attn = false;
 
         // the graph changes without flash attention, need to reserve again
@@ -4770,6 +4770,7 @@ struct llama_opt_params llama_opt_default_params(void) {
         /*checkpoint_path      =*/ nullptr,
         /*load_optimizer_state =*/ false,
         /*assistant_loss_only  =*/ false,
+        /*flash_attn           =*/ false,
     };
 }
 

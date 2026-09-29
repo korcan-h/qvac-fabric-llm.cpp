@@ -1649,6 +1649,15 @@ extern "C" {
         bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
 
         bool assistant_loss_only;
+
+        // keep flash attention enabled during training instead of disabling it
+        // in llama_context::opt_init (default: false)
+        //
+        // requires every layer's backend to implement FLASH_ATTN_BACK
+        // (the CPU backend reports it unsupported)
+        //
+        // TODO: remove once all backends, including CPU, implement FLASH_ATTN_BACK
+        bool flash_attn;
     };
 
     LLAMA_API struct llama_opt_params llama_opt_default_params(void);

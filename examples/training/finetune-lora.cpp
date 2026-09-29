@@ -279,6 +279,7 @@ static void print_lora_usage() {
     printf("  --num-epochs N             Number of training epochs (default: 1)\n");
     printf("  --assistant-loss-only      Use JSON dataset format with masked loss (ChatML/conversation format)\n");
     printf("                             Only computes loss on assistant responses, not system/user prompts\n");
+    printf("  --train-flash-attn         Keep flash attention enabled during training (requires FA-back support).\n");
     printf("  --chat-template PATH  Optional Jinja chat template to render JSON dataset (matches HF apply_chat_template)\n");
     printf("  --learning-rate F          AdamW learning rate (default: 1e-5)\n");
     printf("  --weight-decay F           AdamW weight decay (default: 1e-2)\n");
@@ -515,6 +516,8 @@ struct finetune_params {
     std::string chat_template_path;
     bool assistant_loss_only = false;
     uint32_t lora_seed = 42;
+
+    bool train_flash_attn = false;
 };
 
 static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_params) {
@@ -535,6 +538,14 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--assistant-loss-only") == 0) {
             ft_params.assistant_loss_only = true;
+            remove_arg_single(i);
+            i--;
+        }
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--train-flash-attn") == 0) {
+            ft_params.train_flash_attn = true;
             remove_arg_single(i);
             i--;
         }
@@ -895,6 +906,7 @@ int main(int argc, char ** argv) {
     lopt_params.checkpoint_path      = checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr;
     lopt_params.load_optimizer_state = checkpoint_loaded;
     lopt_params.assistant_loss_only  = ft_params.assistant_loss_only;
+    lopt_params.flash_attn           = ft_params.train_flash_attn;
 
     llama_opt_init(ctx, model, lopt_params);
 
