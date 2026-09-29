@@ -9786,6 +9786,242 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_BACK
+// Compares FLASH_ATTN_BACK against the gradients of an unfused attention reference
+// (mul_mat -> soft_max_ext -> mul_mat) computed on the same backend, so any backend
+// that supports the op can be tested without a CPU implementation.
+// In perf/support/grad mode only the op itself is built, with O as a plain input.
+struct test_flash_attn_back : public test_case {
+    const int64_t hsk; // K head size
+    const int64_t hsv; // V head size
+    const int64_t nh;  // num KV heads
+    const int64_t nr;  // Q heads per KV head, tests for grouped-query attention
+    const int64_t kv;  // kv size
+    const int64_t nb;  // batch size
+
+    const bool mask; // use a causal mask
+
+    const float max_bias;      // ALiBi
+    const float logit_softcap; // Gemma 2
+
+    const ggml_prec prec;
+    const ggml_type type_KV;
+
+    const bool permute_q; // Q as a permuted view of [hsk, nhq, nb], as built by llama
+    const bool kv_view;   // K/V as permuted views of a larger head-interleaved cache, as built by llama
+
+    const float q_amax;    // magnitude of Q: > 1 gives large logits and a peaked softmax
+    const bool  mask_rand; // random finite values on the visible mask entries instead of 0
+
+    ggml_tensor * candidate = nullptr;
+    ggml_tensor * reference = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR15(hsk, hsv, nh, nr, kv, nb, mask, max_bias, logit_softcap, prec, type_KV, permute_q, kv_view, q_amax, mask_rand);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_FLASH_ATTN_BACK);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // Just counting matmul costs, full kv x nb per head (causal skipping not credited), per Q head:
+        // S = Q*K^T and dQ = dS*K, dK = dS^T*Q scale with hsk, dP = dO*V^T and dV = P^T*dO with hsv
+        return 2 * nh*nr * nb * kv * (3*hsk + 2*hsv);
+    }
+
+    std::pair<ggml_tensor *, ggml_tensor *> backend_self_compare_nodes() override {
+        return {candidate, reference};
+    }
+
+    test_flash_attn_back(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr = 1, int64_t kv = 128, int64_t nb = 128,
+                         bool mask = true, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
+                         ggml_type type_KV = GGML_TYPE_F16, bool permute_q = false, bool kv_view = false,
+                         float q_amax = 1.0f, bool mask_rand = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr(nr), kv(kv), nb(nb), mask(mask), max_bias(max_bias), logit_softcap(logit_softcap),
+          prec(prec), type_KV(type_KV), permute_q(permute_q), kv_view(kv_view), q_amax(q_amax), mask_rand(mask_rand) {
+        GGML_ASSERT(!mask || kv >= nb); // every causal mask row needs at least one visible key
+        GGML_ASSERT(mask || (max_bias == 0.0f && !mask_rand));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nhq   = nh*nr;
+        const float   scale = 1.0f/sqrtf(hsk);
+
+        ggml_tensor * q = nullptr;
+        if (permute_q) {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nhq, nb, 1);
+            ggml_set_name(q, "q");
+            q = ggml_permute(ctx, q, 0, 2, 1, 3);
+        } else {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nhq, 1);
+            ggml_set_name(q, "q");
+        }
+
+        // [hs, kv, nh], optionally a view of the first kv cells of a [hs, nh, 2*kv] cache
+        auto create_kv = [&](int64_t hs) -> ggml_tensor * {
+            if (!kv_view) {
+                return ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+            }
+            ggml_tensor * cache = ggml_new_tensor_4d(ctx, type_KV, hs, nh, 2*kv, 1);
+            ggml_tensor * t = ggml_view_4d(ctx, cache, hs, nh, kv, 1, cache->nb[1], cache->nb[2], cache->nb[3], 0);
+            return ggml_permute(ctx, t, 0, 2, 1, 3);
+        };
+
+        ggml_tensor * k = create_kv(hsk);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = create_kv(hsv);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+            ggml_set_name(m, "m");
+        }
+
+        // gradient of the FA output, in the FA output layout
+        ggml_tensor * d = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsv, nhq, nb, 1);
+        ggml_set_name(d, "d");
+
+        const bool op_only = mode != MODE_TEST;
+
+        ggml_tensor * o = nullptr;
+        if (op_only) {
+            o = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsv, nhq, nb, 1);
+        } else {
+            o = ggml_flash_attn_ext(ctx, q, k, v, m, scale, max_bias, logit_softcap);
+            ggml_prec_set_acc(o, prec);
+        }
+        ggml_set_name(o, "o");
+
+        ggml_tensor * back = ggml_flash_attn_back(ctx, q, k, v, m, d, o, scale, max_bias, logit_softcap);
+        ggml_prec_set_acc(back, prec);
+        ggml_set_name(back, "back");
+
+        if (op_only) {
+            return back;
+        }
+
+        // candidate: dQ, dK, dV unpacked from the result, same layout as ggml_flash_attn_back()
+        const size_t offs_k = GGML_PAD(ggml_nelements(q)*sizeof(float), GGML_MEM_ALIGN);
+        const size_t offs_v = offs_k + GGML_PAD(ggml_nelements(k)*sizeof(float), GGML_MEM_ALIGN);
+
+        ggml_tensor * cand_dq = ggml_view_1d(ctx, back, ggml_nelements(q), 0);
+        ggml_tensor * cand_dk = ggml_view_1d(ctx, back, ggml_nelements(k), offs_k);
+        ggml_tensor * cand_dv = ggml_view_1d(ctx, back, ggml_nelements(v), offs_v);
+
+        candidate = ggml_concat(ctx, ggml_concat(ctx, cand_dq, cand_dk, 0), cand_dv, 0);
+        ggml_set_name(candidate, "candidate");
+
+        // reference: unfused attention in F32 and its gradients
+        ggml_tensor * kf = type_KV == GGML_TYPE_F32 ? ggml_cont(ctx, k) : ggml_cast(ctx, k, GGML_TYPE_F32);
+        ggml_tensor * vf = type_KV == GGML_TYPE_F32 ? ggml_cont(ctx, v) : ggml_cast(ctx, v, GGML_TYPE_F32);
+
+        ggml_tensor * kq = ggml_mul_mat(ctx, kf, q); // [kv, nb, nhq]
+
+        // with softcap: s = softcap*tanh(scale*kq/softcap), otherwise s = scale*kq
+        ggml_tensor * th = nullptr;
+        ggml_tensor * s  = nullptr;
+        if (logit_softcap != 0.0f) {
+            th = ggml_tanh(ctx, ggml_scale(ctx, kq, scale/logit_softcap));
+            s  = ggml_scale(ctx, th, logit_softcap);
+        } else {
+            s  = ggml_scale(ctx, kq, scale);
+        }
+
+        ggml_tensor * p = ggml_soft_max_ext(ctx, s, m, 1.0f, max_bias); // [kv, nb, nhq]
+
+        ggml_tensor * d_o = ggml_cont(ctx, ggml_permute(ctx, d, 0, 2, 1, 3)); // [hsv, nb, nhq]
+
+        // dP = dO V^T, then back through the softmax (the additive mask does not change the gradient)
+        ggml_tensor * dp = ggml_mul_mat(ctx, vf, d_o); // [kv, nb, nhq]
+        ggml_tensor * ds = ggml_soft_max_ext_back(ctx, dp, p, 1.0f, 0.0f);
+
+        // gradient w.r.t. kq: scale*(1 - th^2)*dS with softcap, scale*dS otherwise
+        ggml_tensor * dx = th ? ggml_mul(ctx, ds, ggml_scale_bias(ctx, ggml_sqr(ctx, th), -scale, scale))
+                              : ggml_scale(ctx, ds, scale);
+
+        // sums the gradients of the nr Q heads that share each KV head: [ne0, ne1, nhq] -> [ne0, ne1, nh]
+        auto reduce_gqa = [&](ggml_tensor * x) -> ggml_tensor * {
+            if (nr == 1) {
+                return x;
+            }
+            const int64_t ne0 = x->ne[0];
+            const int64_t ne1 = x->ne[1];
+            x = ggml_reshape_4d(ctx, x, ne0*ne1, nr, nh, 1);
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3)); // [nr, ne0*ne1, nh]
+            x = ggml_sum_rows(ctx, x);
+            return ggml_reshape_3d(ctx, x, ne0, ne1, nh);
+        };
+
+        // dQ = K dX
+        ggml_tensor * ref_dq = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, kf)), dx); // [hsk, nb, nhq]
+
+        // dK = Q dX^T
+        ggml_tensor * ref_dk = reduce_gqa(ggml_mul_mat(ctx,
+            ggml_cont(ctx, ggml_transpose(ctx, q)),
+            ggml_cont(ctx, ggml_transpose(ctx, dx)))); // [hsk, kv, nh]
+
+        // dV = dO P^T
+        ggml_tensor * ref_dv = reduce_gqa(ggml_mul_mat(ctx,
+            ggml_cont(ctx, ggml_transpose(ctx, d_o)),
+            ggml_cont(ctx, ggml_transpose(ctx, p)))); // [hsv, kv, nh]
+
+        reference = ggml_concat(ctx,
+            ggml_concat(ctx, ggml_reshape_1d(ctx, ref_dq, ggml_nelements(ref_dq)),
+                             ggml_reshape_1d(ctx, ref_dk, ggml_nelements(ref_dk)), 0),
+            ggml_reshape_1d(ctx, ref_dv, ggml_nelements(ref_dv)), 0);
+        ggml_set_name(reference, "reference");
+
+        // depend on both so that the whole graph is computed
+        ggml_tensor * out = ggml_add(ctx, candidate, reference);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                // views share their source's data: initializing them would overwrite e.g. the scaled Q
+                continue;
+            }
+
+            if (strcmp(t->name, "m") == 0) {
+                // causal mask as used in training; the visible entries hold random values with mask_rand,
+                // -|distance| with ALiBi and 0 otherwise
+                std::mt19937 gen(std::random_device{}());
+                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i1 = 0; i1 < nb; i1++) {
+                    const int64_t pos = i1 + (kv - nb);
+                    for (int64_t i0 = 0; i0 < kv; i0++) {
+                        float val = -INFINITY;
+                        if (i0 <= pos) {
+                            val = mask_rand ? dis(gen) : max_bias > 0.0f ? -(float) (pos - i0) : 0.0f;
+                        }
+                        data[i1*kv + i0] = ggml_fp32_to_fp16(val);
+                    }
+                }
+
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+
+            } else if (strcmp(t->name, "q") == 0) {
+                init_tensor_uniform(t, -q_amax, q_amax);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13323,6 +13559,84 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // FLASH_ATTN_BACK: training-shaped (causal, n_q == n_kv) plus partial tiles, GQA and feature flags
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (int hs : { 64, 128, 256 }) {
+            for (int nr : { 1, 4 }) {
+                for (int kv : { 64, 113, 256 }) {
+                    test_cases.emplace_back(new test_flash_attn_back(hs, hs, 2, nr, kv, kv, true, 0.0f, 0.0f, GGML_PREC_F32, type_KV));
+                }
+            }
+        }
+    }
+    
+    // head sizes of current models, incl. hsk != hsv
+    for (auto [hsk, hsv] : std::vector<std::pair<int, int>>{ {40, 40}, {72, 72}, {80, 80}, {96, 96}, {112, 112}, {192, 128}, {512, 512} }) {
+        test_cases.emplace_back(new test_flash_attn_back(hsk, hsv, 2, 2, 113, 113, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    }
+    
+    // GQA ratios: dK/dV are summed over the Q heads sharing a KV head
+    for (int nr : { 2, 8, 12, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_back(128, 128, 1, nr, 128, 128, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    }
+    
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 1, 1, 128, 128, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16)); // nh = 1
+    
+    // layouts as built by llama: permuted Q, K/V as views of the KV cache
+    for (int nr : { 1, 4 }) {
+        test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, nr, 113, 113, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, true,  false));
+        test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, nr, 113, 113, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, false, true));
+        test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, nr, 113, 113, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, true,  true));
+        test_cases.emplace_back(new test_flash_attn_back( 64,  64, 2, nr, 256,  33, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F32, true,  true));
+    }
+    
+    // partial final tiles in both dims for any pow2 tile size, n_q < n_kv, small batches
+    test_cases.emplace_back(new test_flash_attn_back( 64,  64, 2, 1,  513,  33, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 1,  513, 513, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 1,  256,  33, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 4,  113,   3, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 4,  113,   1, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    
+    // no mask: bidirectional (n_q == n_kv, vision-tower like, aligned and odd) and n_q != n_kv
+    for (int64_t n : { 247, 256 }) {
+        test_cases.emplace_back(new test_flash_attn_back(64, 64, 2, 1, n, n, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    }
+    
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 1,  113,  47, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    
+    // precision: allows F16 accumulation / tensor-core paths
+    for (int hs : { 64, 128, 256 }) {
+        test_cases.emplace_back(new test_flash_attn_back(hs, hs, 2, 4, 256, 256, true, 0.0f, 0.0f, GGML_PREC_DEFAULT, GGML_TYPE_F16));
+    }
+    
+    // softcap (Gemma 2): the scaled logits of uniform [-1, 1] inputs are ~0.3, so a small cap is needed
+    // for tanh to saturate - with a realistic cap (30-50) a missing (1 - tanh^2) term stays below max_nmse_err
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 1,  128, 128, true,  0.0f,  0.5f, GGML_PREC_F32,     GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(256, 256, 2, 2,  128, 128, true,  0.0f,  1.0f, GGML_PREC_F32,     GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(256, 256, 2, 2,  128, 128, true,  0.0f,  1.0f, GGML_PREC_DEFAULT, GGML_TYPE_F16));
+    
+    // ALiBi
+    test_cases.emplace_back(new test_flash_attn_back( 64,  64, 4, 1,  128, 128, true,  8.0f,  0.0f, GGML_PREC_F32,     GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back( 64,  64, 1, 4,  113, 113, true,  8.0f,  0.0f, GGML_PREC_F32,     GGML_TYPE_F16));
+    
+    // large logits (peaked softmax, max subtraction, F16 overflow): with q_amax = 16 the scaled logits reach ~13;
+    // with softcap they are bounded instead and tanh saturates, so (1 - tanh^2) is close to 0
+    for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_DEFAULT }) {
+        test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 4, 256, 256, true, 0.0f, 0.0f, prec, GGML_TYPE_F16, false, false, 16.0f));
+        test_cases.emplace_back(new test_flash_attn_back( 64,  64, 2, 1, 513,  33, true, 0.0f, 0.0f, prec, GGML_TYPE_F16, false, false, 16.0f));
+        test_cases.emplace_back(new test_flash_attn_back(256, 256, 2, 2, 128, 128, true, 0.0f, 1.0f, prec, GGML_TYPE_F16, false, false, 16.0f));
+    }
+    
+    test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 4, 113, 113, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, true, true, 16.0f));
+    
+    // finite mask values, not only 0/-inf, also scaled by the ALiBi slope
+    for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_DEFAULT }) {
+        test_cases.emplace_back(new test_flash_attn_back(128, 128, 2, 1, 256, 256, true, 0.0f, 0.0f, prec, GGML_TYPE_F16, false, false, 1.0f, true));
+        test_cases.emplace_back(new test_flash_attn_back( 64,  64, 2, 4, 256,  33, true, 0.0f, 0.0f, prec, GGML_TYPE_F16, false, false, 1.0f, true));
+    }
+    
+    test_cases.emplace_back(new test_flash_attn_back( 64,  64, 2, 4, 113, 113, true, 8.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, false, false, 1.0f, true));
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -13921,6 +14235,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // FLASH_ATTN_BACK at fine-tuning shapes (causal, n_q == n_kv = ubatch):
+    // llama-class 128/128 gqa 4, Qwen-class 128/128 gqa 8, Gemma-class 256/256 with softcap
+    for (int64_t n : {512, 1024, 2048}) {
+        for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
+            test_cases.emplace_back(new test_flash_attn_back(128, 128, 8, 4, n, n, true, 0.0f,  0.0f, prec, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_back(128, 128, 4, 8, n, n, true, 0.0f,  0.0f, prec, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_back(256, 256, 4, 2, n, n, true, 0.0f, 30.0f, prec, GGML_TYPE_F16));
+        }
+    }
+
+    test_cases.emplace_back(new test_flash_attn_back(64, 64, 8, 1, 1024, 1024, true, 0.0f, 0.0f, GGML_PREC_DEFAULT, GGML_TYPE_F16));
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

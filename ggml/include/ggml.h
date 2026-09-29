@@ -2592,6 +2592,10 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    GGML_API void ggml_flash_attn_back_add_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
+
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,

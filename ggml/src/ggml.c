@@ -5836,21 +5836,29 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
-void ggml_flash_attn_ext_add_sinks(
+static inline void ggml_flash_attn_add_sinks_at(
         struct ggml_tensor * a,
-        struct ggml_tensor * sinks) {
+        struct ggml_tensor * sinks,
+        enum ggml_op         op,
+        uint32_t             sink_idx) {
+    GGML_ASSERT(sink_idx < GGML_MAX_SRC);
     if (!sinks) {
-        a->src[4] = NULL;
+        a->src[sink_idx] = NULL;
         return;
     }
 
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT ||
-                a->op == GGML_OP_FLASH_ATTN_BACK);
-    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(a->op == op);
+    GGML_ASSERT(a->src[sink_idx] == NULL);
     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
-    a->src[4] = sinks;
+    a->src[sink_idx] = sinks;
+}
+
+void ggml_flash_attn_ext_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    ggml_flash_attn_add_sinks_at(a, sinks, GGML_OP_FLASH_ATTN_EXT, 4);
 }
 
 // ggml_flash_attn_back
@@ -5940,11 +5948,17 @@ struct ggml_tensor * ggml_flash_attn_back(
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
-    result->src[3] = mask;
-    // result->src[4] == optional sinks.
-    result->src[5] = d;
-    result->src[6] = o;
+    result->src[3] = o;
+    result->src[4] = d;
+    result->src[5] = mask;
+    // result->src[6] == optional sinks.
     return result;
+}
+
+void ggml_flash_attn_back_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    ggml_flash_attn_add_sinks_at(a, sinks, GGML_OP_FLASH_ATTN_BACK, 6);
 }
 
 // ggml_ssm_conv
@@ -7862,7 +7876,7 @@ static void ggml_compute_backward(
             struct ggml_tensor * back = ggml_flash_attn_back(ctx, srcs[0], srcs[1], srcs[2], srcs[3], d,
                                                              tensor, scale, max_bias, logit_softcap);
             if (srcs[4]) {
-                ggml_flash_attn_ext_add_sinks(back, srcs[4]);
+                ggml_flash_attn_back_add_sinks(back, srcs[4]);
             }
             ggml_flash_attn_ext_set_n_kv_max(back, n_kv_max);
             ggml_prec_set_acc(back, prec);
