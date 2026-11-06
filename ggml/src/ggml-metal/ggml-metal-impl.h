@@ -136,6 +136,7 @@
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
 #define FC_GATED_DELTA_NET_DEFERRED    2400
+#define FC_FLASH_ATTN_EXT_BACK_MMA     2500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -149,6 +150,10 @@
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 #define OP_FLASH_ATTN_EXT_VEC_NHPTG_MAX 4
+
+#define OP_FLASH_ATTN_EXT_BACK_MMA_NSG 4
+#define OP_FLASH_ATTN_EXT_BACK_MMA_BR  (8 * OP_FLASH_ATTN_EXT_BACK_MMA_NSG)  // outer rows per block
+#define OP_FLASH_ATTN_EXT_BACK_MMA_BC  16                                    // inner columns per tile
 
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NHPTG   8
@@ -539,6 +544,11 @@ typedef struct {
     uint64_t nbm3;
     float   scale;
 } ggml_metal_kargs_ext_back_kargs;
+
+typedef struct {
+    int64_t n; // floats of dK and dV, the temp buffer holds nsplit partials of them
+    int32_t nsplit;
+} ggml_metal_kargs_ext_back_sum_splits;
 
 typedef struct {
     int32_t  ne01;
