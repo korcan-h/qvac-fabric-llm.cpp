@@ -13197,20 +13197,38 @@ struct test_flash_attn_ext_back : public test_case {
     const ggml_flash_attn_ext_back_target target;
     const bool mask_zero; // visible mask entries are 0 instead of random, as in training
     const float grad_scale; // grad_o in [-grad_scale, grad_scale], training gradients are far below 1
+    const int64_t nhm; // heads of the mask, divides nh*nr23[0]
+    const bool mask_rows; // q row i1 of mask head i2 is fully masked when (i1 + i2) % 3 == 1
 
     std::string vars() override {
-        return VARS_TO_STR11(hs, nh, nr23, kv, nb, mask, type_KV, permute, target, mask_zero, grad_scale);
+        return VARS_TO_STR13(hs, nh, nr23, kv, nb, mask, type_KV, permute, target, mask_zero, grad_scale, nhm, mask_rows);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
+    // the stats of fully masked rows are -INFINITY (or -FLT_MAX) in both results, eval checks the signs match; they would
+    // make nmse NaN or 0, which passes any error
+    double err(const float * a, const float * b, size_t n) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            if (isinf_or_max(a[i]) && isinf_or_max(b[i])) {
+                continue;
+            }
+            mse_a_b += (a[i] - b[i])*(a[i] - b[i]);
+            mse_a_0 += a[i]*a[i];
+        }
+        return mse_a_b / mse_a_0;
+    }
+
     test_flash_attn_ext_back(int64_t hs = 64, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                              bool mask = true, ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                             ggml_flash_attn_ext_back_target target = GGML_FLASH_ATTN_EXT_BACK_DQ, bool mask_zero = false, float grad_scale = 1.0f)
+                             ggml_flash_attn_ext_back_target target = GGML_FLASH_ATTN_EXT_BACK_DQ, bool mask_zero = false, float grad_scale = 1.0f,
+                             int64_t nhm = 1, bool mask_rows = false)
         : hs(hs), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), type_KV(type_KV), permute(permute), target(target), mask_zero(mask_zero),
-          grad_scale(grad_scale) {}
+          grad_scale(grad_scale), nhm(nhm), mask_rows(mask_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) -> ggml_tensor * {
@@ -13237,7 +13255,7 @@ struct test_flash_attn_ext_back : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, nhm, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -13264,6 +13282,23 @@ struct test_flash_attn_ext_back : public test_case {
                     init_tensor_kq_mask_causal(t, 0.0f, 0.0f);
                 } else {
                     init_tensor_kq_mask_causal(t);
+                }
+                if (mask_rows) {
+                    // fully masked rows next to visible rows of the same tiles, their stats are -INFINITY
+                    std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+                    for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+                        for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+                            for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                                if ((i1 + i2) % 3 != 1) {
+                                    continue;
+                                }
+                                ggml_fp16_t * row = data.data() + ((i3*t->ne[2] + i2)*t->ne[1] + i1)*t->ne[0];
+                                std::fill(row, row + t->ne[0], ggml_fp32_to_fp16(-INFINITY));
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
                 }
             } else if (strcmp(t->name, "grad_o") == 0) {
                 init_tensor_uniform(t, -grad_scale, grad_scale);
@@ -17808,6 +17843,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
             test_cases.emplace_back(new test_flash_attn_ext_back( 64, 2, {2, 1}, 512, 75, true, GGML_TYPE_F32, {0, 1, 2, 3}, target, true));
             test_cases.emplace_back(new test_flash_attn_ext_back(128, 2, {4, 1}, 1024, 1024, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
+
+            // D = 112
+            test_cases.emplace_back(new test_flash_attn_ext_back(112, 2, {2, 1}, 113, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
+            test_cases.emplace_back(new test_flash_attn_ext_back(112, 1, {4, 2},  64, 40, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+            // a mask per head, and per pair of heads
+            test_cases.emplace_back(new test_flash_attn_ext_back( 64, 2, {2, 1}, 113, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, false, 1.0f, 4));
+            test_cases.emplace_back(new test_flash_attn_ext_back(128, 2, {2, 2},  64, 40, true, GGML_TYPE_F32, {0, 1, 2, 3}, target, false, 1.0f, 2));
+            // fully masked q rows: alone, with a mask per head, with 0 for the visible entries, and at D = 256 for the warp kernels
+            test_cases.emplace_back(new test_flash_attn_ext_back( 64, 2, {2, 1}, 113, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, false, 1.0f, 1, true));
+            test_cases.emplace_back(new test_flash_attn_ext_back(128, 2, {2, 1},  64, 40, true, GGML_TYPE_F32, {0, 1, 2, 3}, target, false, 1.0f, 4, true));
+            test_cases.emplace_back(new test_flash_attn_ext_back( 96, 2, {2, 1}, 256, 64, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true,  1.0f, 1, true));
+            test_cases.emplace_back(new test_flash_attn_ext_back(256, 2, {2, 1}, 113, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, false, 1.0f, 1, true));
         }
     } // !GGML_SKIP_FLASH_ATTN
 
@@ -18951,6 +18998,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_back(128, 8, {4, 1}, 1024, 1024, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
         // single kv head, the shape the -sm tensor PARTIAL path uses
         test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, {32, 1}, 1024, 1024, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
+        // single kv head with a short query: few DKV threadgroups, so the q tile split decides the speed
+        test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, { 8, 1}, 1024,   32, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
+        test_cases.emplace_back(new test_flash_attn_ext_back( 64, 1, { 8, 1}, 1024,   64, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
+        test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, { 8, 1}, 4096,   32, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
     }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
