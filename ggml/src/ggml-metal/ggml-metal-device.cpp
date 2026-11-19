@@ -2710,6 +2710,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(gg
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gelu_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_GELU_BACK);
+
+    char base[256];
+    char name[256];
+
+    const int64_t n = ggml_nelements(op);
+    const char * suffix = (n % 4 == 0) ? "_4" : "";
+
+    snprintf(base, 256, "kernel_gelu_back%s", suffix);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_OPT_STEP_ADAMW);
 
