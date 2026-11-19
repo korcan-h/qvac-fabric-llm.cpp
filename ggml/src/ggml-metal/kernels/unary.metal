@@ -203,6 +203,36 @@ kernel void kernel_silu_back_f32(
     dx[gid] = dy[gid] * s * (1.0f + x[gid] * (1.0f - s));
 }
 
+static inline float ggml_metal_gelu_back(float x, float dy) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    const float t  = precise::tanh(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x));
+    const float dt = SQRT_2_OVER_PI*(1.0f + 3.0f*GELU_COEF_A*x*x)*(1.0f - t*t);
+    return dy*0.5f*(1.0f + t + x*dt);
+}
+
+kernel void kernel_gelu_back(
+        device const float * grad,
+        device const float * src1,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = ggml_metal_gelu_back(src1[tpig], grad[tpig]);
+}
+
+kernel void kernel_gelu_back_4(
+        device const float4 * grad,
+        device const float4 * src1,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 x  = src1[tpig];
+    const float4 dy = grad[tpig];
+    dst[tpig] = float4(
+        ggml_metal_gelu_back(x[0], dy[0]),
+        ggml_metal_gelu_back(x[1], dy[1]),
+        ggml_metal_gelu_back(x[2], dy[2]),
+        ggml_metal_gelu_back(x[3], dy[3]));
+}
+
 template<typename T>
 kernel void kernel_reglu(
         constant ggml_metal_kargs_glu & args,

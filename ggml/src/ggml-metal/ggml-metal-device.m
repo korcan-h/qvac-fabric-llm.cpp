@@ -1753,6 +1753,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    ggml_is_contiguous_1(op) &&
                    ggml_are_same_shape(op, op->src[0]) &&
                    ggml_are_same_shape(op, op->src[1]);
+        case GGML_OP_GELU_BACK:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;
